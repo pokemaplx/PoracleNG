@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -1383,4 +1384,209 @@ func TestLaneStats(t *testing.T) {
 		total, active, maxDepth, target, _ := fq.LaneStats()
 		return active == 1 && total == 6 && maxDepth == 6 && target == "t"
 	}, time.Second)
+}
+
+// drainLane blocks a lane's drainer on its first job so the lane's buffer can
+// be filled deterministically, and returns a release func plus a recorder of
+// every job that actually reached the sender.
+func blockedLane(t *testing.T, cfg QueueConfig) (fq *FairQueue, release, stop func(), rec *sentRecorder) {
+	t.Helper()
+	rec = &sentRecorder{}
+	gate := make(chan struct{})
+	started := make(chan struct{}, 1)
+	sender := &laneMockSender{onSend: func(job *Job) {
+		rec.add(job)
+		if job.Target == "full" {
+			select {
+			case started <- struct{}{}:
+				<-gate // only the first job parks the drainer
+			default:
+			}
+		}
+	}}
+	fq, _ = newTestFairQueue(t, map[string]Sender{"discord": sender}, cfg)
+	fq.Start()
+
+	if !fq.enqueue(&Job{Type: "discord:channel", Target: "full", LogReference: "head"}, true) {
+		t.Fatal("first send should be accepted")
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("lane drainer never started")
+	}
+
+	var relOnce, stopOnce sync.Once
+	release = func() { relOnce.Do(func() { close(gate) }) }
+	// stop is idempotent so a test can drain explicitly before asserting and
+	// still defer it for the failure paths; FairQueue.Stop itself panics if
+	// called twice.
+	stop = func() { stopOnce.Do(func() { release(); fq.Stop() }) }
+	return fq, release, stop, rec
+}
+
+type sentRecorder struct {
+	mu   sync.Mutex
+	jobs []string
+}
+
+func (r *sentRecorder) add(j *Job) {
+	r.mu.Lock()
+	r.jobs = append(r.jobs, j.LogReference)
+	r.mu.Unlock()
+}
+
+func (r *sentRecorder) seen(ref string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, s := range r.jobs {
+		if s == ref {
+			return true
+		}
+	}
+	return false
+}
+
+// enqueueWithin runs enqueue on a goroutine and fails the test if it has not
+// returned within d. The whole point of the overflow policy is that enqueue
+// returns promptly on a saturated lane, so a hang is the failure being tested
+// for — never something a test should sit on.
+func enqueueWithin(t *testing.T, fq *FairQueue, job *Job, d time.Duration) bool {
+	t.Helper()
+	res := make(chan bool, 1)
+	go func() { res <- fq.enqueue(job, true) }()
+	select {
+	case ok := <-res:
+		return ok
+	case <-time.After(d):
+		t.Fatalf("enqueue for %s blocked on a full lane", job.LogReference)
+		return false
+	}
+}
+
+// TestLanes_OverflowShedsOldestKeepsNewest is the core of the overflow policy:
+// a saturated lane discards its STALEST buffered job to make room for the
+// arriving one. Alerts are perishable — keeping 200 expired jobs and rejecting
+// the live one is the worst possible shedding order.
+func TestLanes_OverflowShedsOldestKeepsNewest(t *testing.T) {
+	fq, _, stop, rec := blockedLane(t, QueueConfig{ConcurrentDiscord: 2, PerRouteBuffer: 2})
+	defer stop()
+
+	// Fill the buffer behind the parked drainer.
+	for _, ref := range []string{"stale", "middle"} {
+		if !fq.enqueue(&Job{Type: "discord:channel", Target: "full", LogReference: ref}, true) {
+			t.Fatalf("%s should fit in the buffer", ref)
+		}
+	}
+	// Buffer full — this must evict "stale", not reject or block.
+	if !enqueueWithin(t, fq, &Job{Type: "discord:channel", Target: "full", LogReference: "fresh"}, 2*time.Second) {
+		t.Fatal("arriving send must be accepted by shedding the oldest")
+	}
+
+	stop() // drain everything still buffered before asserting
+
+	if rec.seen("stale") {
+		t.Error("oldest buffered job should have been shed")
+	}
+	if !rec.seen("fresh") {
+		t.Error("newest job should have been delivered")
+	}
+}
+
+// TestLanes_OverflowNeverBlocksProducer is the reporter's actual bug: a
+// saturated destination must not occupy the shared render worker that called
+// Dispatch, nor stop an unrelated destination from accepting work.
+func TestLanes_OverflowNeverBlocksProducer(t *testing.T) {
+	fq, _, stop, _ := blockedLane(t, QueueConfig{ConcurrentDiscord: 2, PerRouteBuffer: 1})
+	defer stop()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Far more jobs than the buffer holds; none may block.
+		for i := range 50 {
+			fq.enqueue(&Job{Type: "discord:channel", Target: "full", LogReference: fmt.Sprintf("j%d", i)}, true)
+		}
+		fq.enqueue(&Job{Type: "discord:channel", Target: "other", LogReference: "unrelated"}, true)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("enqueue blocked on a saturated lane — producer was not protected")
+	}
+}
+
+// TestLanes_OverflowPreservesBypassJobs guards the invariant that
+// DispatchBypass and processJob step 2b both document: the limiter can never
+// swallow the very message reporting on itself. A rate-limit breach notice is
+// dispatched precisely because the destination is flooded, so its lane is full
+// by definition — head-eviction must skip it and shed an ordinary send instead.
+func TestLanes_OverflowPreservesBypassJobs(t *testing.T) {
+	fq, _, stop, rec := blockedLane(t, QueueConfig{ConcurrentDiscord: 2, PerRouteBuffer: 2})
+	defer stop()
+
+	// Breach notice lands at the head of the buffer, then ordinary alerts
+	// arrive and would evict it.
+	if !fq.enqueue(&Job{Type: "discord:channel", Target: "full", LogReference: "breach-notice", BypassRateLimit: true}, true) {
+		t.Fatal("bypass job should be accepted")
+	}
+	if !fq.enqueue(&Job{Type: "discord:channel", Target: "full", LogReference: "ordinary"}, true) {
+		t.Fatal("ordinary job should fit")
+	}
+	for i := range 5 {
+		enqueueWithin(t, fq, &Job{Type: "discord:channel", Target: "full", LogReference: fmt.Sprintf("flood%d", i)}, 2*time.Second)
+	}
+
+	stop() // drain everything still buffered before asserting
+
+	if !rec.seen("breach-notice") {
+		t.Error("bypass job was shed — the rate-limit notice can be swallowed by its own flood")
+	}
+}
+
+// TestLanes_OverflowKeepsPendingConsistent proves shed jobs decrement the
+// lane's pending counter. A leak here means the reaper never deletes the lane
+// and its drainer goroutine lives forever.
+func TestLanes_OverflowKeepsPendingConsistent(t *testing.T) {
+	fq, release, stop, _ := blockedLane(t, QueueConfig{ConcurrentDiscord: 2, PerRouteBuffer: 2})
+	// stop() releases first: a t.Fatal below must not leave Stop waiting on a
+	// drainer that is still parked.
+	defer stop()
+
+	for i := range 20 {
+		enqueueWithin(t, fq, &Job{Type: "discord:channel", Target: "full", LogReference: fmt.Sprintf("j%d", i)}, 2*time.Second)
+	}
+	release()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		fq.lanesMu.Lock()
+		l, ok := fq.lanes["full"]
+		var pending int
+		if ok {
+			pending = l.pending
+		}
+		fq.lanesMu.Unlock()
+		if ok && pending == 0 {
+			return // drained with an exact accounting
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("lane pending never returned to zero — shed jobs leaked the counter")
+}
+
+// TestLanes_OverflowCountsShedJobs proves loss is observable. Without a
+// dedicated counter an operator cannot alert on discarded alerts.
+func TestLanes_OverflowCountsShedJobs(t *testing.T) {
+	fq, _, stop, _ := blockedLane(t, QueueConfig{ConcurrentDiscord: 2, PerRouteBuffer: 1})
+	defer stop()
+
+	before := fq.ShedCount()
+	for i := range 10 {
+		enqueueWithin(t, fq, &Job{Type: "discord:channel", Target: "full", LogReference: fmt.Sprintf("j%d", i)}, 2*time.Second)
+	}
+	if got := fq.ShedCount() - before; got == 0 {
+		t.Fatal("ShedCount did not record any shed jobs")
+	}
 }
