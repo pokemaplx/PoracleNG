@@ -891,14 +891,22 @@ func main() {
 				metrics.DeliveryLaneMaxDepth.Set(float64(maxDepth))
 				metrics.DeliveryLanesNearCapacity.Set(float64(nearCap))
 
-				// Escalate to WARN when a lane nears capacity OR backpressure
-				// advanced since the last sample — the "developing bad
-				// situation" signal.
+				// Escalate to WARN when a lane nears capacity OR a lane hit
+				// capacity since the last sample — the "developing bad
+				// situation" signal. Say "shedding" rather than "backing up"
+				// once anything has actually been discarded: enqueue never
+				// blocks, so a full lane means messages were thrown away, not
+				// merely delayed.
 				bp := proc.dispatcher.BackpressureCount()
+				shed := proc.dispatcher.ShedCount()
 				buf := proc.dispatcher.PerRouteBuffer()
 				if (buf > 0 && maxDepth >= buf*8/10) || bp > lastBackpressureSeen {
-					log.Warnf("[Status] delivery backing up: %d lanes, %d queued, deepest lane %d/%d (%s), %d near-cap, backpressure=%d",
-						active, total, maxDepth, buf, deepestTarget, nearCap, bp)
+					state := "backing up"
+					if shed > 0 {
+						state = "shedding messages"
+					}
+					log.Warnf("[Status] delivery %s: %d lanes, %d queued, deepest lane %d/%d (%s), %d near-cap, lane-full=%d, shed=%d",
+						state, active, total, maxDepth, buf, deepestTarget, nearCap, bp, shed)
 				}
 				lastBackpressureSeen = bp
 			}
