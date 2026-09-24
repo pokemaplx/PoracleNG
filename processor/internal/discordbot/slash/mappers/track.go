@@ -58,7 +58,7 @@ func Track(opts []*discordgo.ApplicationCommandInteractionDataOption) ([]string,
 	if v, ok := o["size"]; ok {
 		size := strings.ToLower(v.StringValue())
 		if size != "" && size != "all" {
-			tokens = append(tokens, size)
+			tokens = append(tokens, "size:"+size)
 		}
 	}
 

@@ -210,7 +210,7 @@ func TestTrackMapperSize(t *testing.T) {
 		sopt("pokemon", "25"),
 		sopt("size", "xxl"),
 	})
-	want := []string{"25", "xxl"}
+	want := []string{"25", "size:xxl"}
 	if !reflect.DeepEqual(tokens, want) {
 		t.Errorf("tokens=%v want %v", tokens, want)
 	}
@@ -244,7 +244,7 @@ func TestTrackMapperAllOptions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"25", "iv95", "great5", "ultra10", "little7", "d250", "clean", "template:pvp", "form:alola", "costume:1", "xl"}
+	want := []string{"25", "iv95", "great5", "ultra10", "little7", "d250", "clean", "template:pvp", "form:alola", "costume:1", "size:xl"}
 	if !reflect.DeepEqual(tokens, want) {
 		t.Errorf("tokens=%v want %v", tokens, want)
 	}
